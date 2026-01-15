@@ -1,26 +1,20 @@
-/*#pragma once
-#include <Arduino.h>
-#include "sensors.h"
+#ifndef WEB_APP_H
+#define WEB_APP_H
 
-void webInit();
-void webLoop();                 
-void webSetAccess(bool ok);     // NFC -> autorise/stoppe l’accès logique
-void webPushSample(const Sample3 &s); // push vers SSE + RAM*/
+#include <time.h>
 
-#pragma once
-#include <Arduino.h>
-
+// ===== Structure pour les données capteurs =====
 struct Sample3 {
-  uint32_t t;
-  float b1Temp, b1Hum, b1O2;
-  float b2Temp, b2Hum;
-  float b3Temp, b3Hum;
+  time_t t;        // timestamp
+  float b1Temp, b1Hum, b1O2;  // Bac 1
+  float b2Temp, b2Hum;         // Bac 2
+  float b3Temp, b3Hum;         // Bac 3
 };
 
-void webInit();
-void webLoop();
-void webSetAccess(bool enable);
+// ===== API Web =====
+void webInit();           // Initialiser WiFi AP + serveur web
+void webPushSample(const Sample3 &s);  // Ajouter données + CSV + SSE
+void webSetAccess(bool ok);  // Définir accès (pour NFC)
+void webLoop();           // Boucle web (optionnel)
 
-// Ajoute ça
-bool webLoadCsvToHistory(const char* path);
-
+#endif
