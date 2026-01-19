@@ -29,6 +29,12 @@ static unsigned long lastReadingTime = 0;
 static bool sensorsActive = false;
 static unsigned long activationStartTime = 0;
 
+// ==== Deep Sleep Configuration ====
+const int PUSHBUTTON_PIN = 13;          // Pin GPIO13 pour le bouton poussoir
+const int DEEP_SLEEP_TIMEOUT_US = 3600000000;  // 1 heure en microsecondes
+static bool wakeupByButton = false;     // Flag pour réveil par bouton
+static bool inAccessPointMode = false;  // Mode point d'accès activé
+
 // ==== Capteur O2 I2C ====
 const uint8_t OXYGEN_I2C_ADDR = 0x73; // à ajuster selon ton capteur
 float readOxygen();
@@ -37,6 +43,11 @@ float readOxygen();
 void activateSensors();
 void deactivateSensors();
 void updateSensorPowerState();
+
+// ==== Déclarations forward pour Deep Sleep ====
+void enterDeepSleep();
+void handleButtonWakeup();
+void setupDeepSleepMode();
 
 // ==== Contrôle PWM des modules MOSFET ====
 void initMOSFET() {
@@ -87,6 +98,71 @@ void updateSensorPowerState() {
   // Vérifier si les capteurs ont été actifs assez longtemps
   if (sensorsActive && (currentTime - activationStartTime >= ACTIVE_DURATION)) {
     deactivateSensors();
+  }
+}
+
+// ================== DEEP SLEEP MODE ==================
+
+// Fonction appelée lors du réveil par bouton (ISR)
+void IRAM_ATTR handleButtonInterrupt() {
+  wakeupByButton = true;
+}
+
+// Configuration du deep sleep avec timer et bouton
+void setupDeepSleepMode() {
+  // Configurer le timer de deep sleep (1 heure)
+  esp_sleep_enable_timer_wakeup(DEEP_SLEEP_TIMEOUT_US);
+  
+  // Configurer le réveil par bouton (GPIO13, front descendant)
+  esp_sleep_enable_ext0_wakeup((gpio_num_t)PUSHBUTTON_PIN, 0);
+  
+  Serial.println("[DEEP SLEEP] Configuration: Timer 1H + Bouton GPIO13");
+}
+
+// Entrer en mode deep sleep
+void enterDeepSleep() {
+  Serial.println("\n[DEEP SLEEP] Extinction des capteurs et entrée en Deep Sleep...");
+  Serial.println("[DEEP SLEEP] Réveil dans 1 heure OU appui bouton");
+  
+  // Éteindre tous les capteurs
+  deactivateSensors();
+  
+  // Désactiver WiFi pour économiser la batterie
+  if (inAccessPointMode) {
+    webStop();
+    inAccessPointMode = false;
+  }
+  
+  // Petite pause avant de dormir
+  delay(100);
+  Serial.println("[DEEP SLEEP] Zzzzzzz...");
+  
+  // Entrer en deep sleep
+  esp_deep_sleep_start();
+}
+
+// Gérer le réveil et déterminer la source
+void handleWakeup() {
+  esp_sleep_wakeup_cause_t wakeup_reason = esp_sleep_get_wakeup_cause();
+  
+  switch (wakeup_reason) {
+    case ESP_SLEEP_WAKEUP_TIMER:
+      Serial.println("\n[WAKEUP] Réveil par TIMER - Collecte de données");
+      wakeupByButton = false;
+      sensorsActive = false;  // Réinitialiser pour la collecte
+      break;
+      
+    case ESP_SLEEP_WAKEUP_EXT0:
+      Serial.println("\n[WAKEUP] Réveil par BOUTON - Mode Point d'accès");
+      wakeupByButton = true;
+      inAccessPointMode = true;
+      // Redémarrer le serveur web pour l'accès à l'IHM
+      webInit();
+      break;
+      
+    default:
+      Serial.println("\n[WAKEUP] Premier démarrage ou réveil inconnu");
+      sensorsActive = false;
   }
 }
 
@@ -265,6 +341,9 @@ void setup() {
   
   Serial.println("\n=== SYSTÈME DÉMARRAGE ===\n");
   
+  // Vérifier la cause du réveil
+  handleWakeup();
+  
   // Initialiser RS485
   pinMode(DE_RE, OUTPUT);
   digitalWrite(DE_RE, LOW);
@@ -273,6 +352,10 @@ void setup() {
   // Initialiser I2C
   Wire.begin(21, 22);
   Wire.setClock(100000);  // 100 kHz
+  
+  // Initialiser le bouton poussoir
+  pinMode(PUSHBUTTON_PIN, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(PUSHBUTTON_PIN), handleButtonInterrupt, FALLING);
   
   // Initialiser MOSFET PWM
   initMOSFET();
@@ -289,16 +372,24 @@ void setup() {
   struct timeval tv = {.tv_sec = test_time};
   settimeofday(&tv, NULL);
   
-  // Initialiser le serveur web
-  webInit();
+  // Configurer le deep sleep
+  setupDeepSleepMode();
+  
+  // Initialiser le serveur web (sera arrêté après collecte si en mode automatique)
+  if (!inAccessPointMode) {
+    webStop();
+  } else {
+    webInit();
+  }
   
   // Première activation immédiate pour la première lecture
   lastReadingTime = millis();
   
   Serial.println("RS485 initialisé à 9600 baud");
   Serial.println("I2C initialisé à 100 kHz");
+  Serial.println("Bouton configuré sur GPIO13");
   Serial.println("MOSFET PWM configuré (2 min active / 1H d'intervalle)");
-  Serial.println("Attente de l'activation des capteurs...\n");
+  Serial.println("Deep Sleep configuré (réveil timer 1H + bouton)\n");
 }
 
 // ------------------ LOOP ------------------
@@ -306,13 +397,55 @@ void loop() {
   // Mettre à jour l'état d'alimentation des capteurs
   updateSensorPowerState();
   
-  // Si les capteurs ne sont pas actifs, attendre
+  // ===== MODE POINT D'ACCÈS (réveil par bouton) =====
+  if (inAccessPointMode) {
+    Serial.println("\n[MODE AP] Point d'accès actif - Interface web disponible");
+    Serial.println("[MODE AP] Appuyez sur le bouton pour revenir au mode collection automatique");
+    
+    // Boucle infinie pour maintenir le point d'accès
+    while (inAccessPointMode) {
+      webLoop();  // Gérer les connexions web
+      
+      // Vérifier si le bouton a été appuyé pour quitter le mode AP
+      if (wakeupByButton) {
+        wakeupByButton = false;
+        inAccessPointMode = false;
+        Serial.println("[MODE AP] Fermeture du point d'accès - Entrée en Deep Sleep");
+        break;
+      }
+      
+      delay(100);
+    }
+    
+    // Quitter le mode AP et entrer en deep sleep
+    enterDeepSleep();
+  }
+  
+  // ===== MODE COLLECTE AUTOMATIQUE =====
+  
+  // Si les capteurs ne sont pas actifs, attendre ou entrer en deep sleep
   if (!sensorsActive) {
     unsigned long timeUntilNextReading = READING_INTERVAL - (millis() - lastReadingTime);
     Serial.print("[SLEEP MODE] Prochaine lecture dans : ");
     Serial.print(timeUntilNextReading / 1000);
     Serial.println(" secondes");
-    delay(10000);  // Vérifier l'état tous les 10 secondes
+    
+    // Attendre 5 secondes avant de revérifier
+    delay(5000);
+    
+    // Si le bouton a été appuyé, passer en mode point d'accès
+    if (wakeupByButton) {
+      wakeupByButton = false;
+      inAccessPointMode = true;
+      webInit();
+      return;  // Retour à la boucle pour gérer le mode AP
+    }
+    
+    // Vérifier s'il est temps d'entrer en deep sleep (après 5 secondes d'inactivité)
+    if (!sensorsActive && (millis() - lastReadingTime > 5000)) {
+      enterDeepSleep();
+    }
+    
     return;
   }
 
@@ -389,7 +522,8 @@ void loop() {
   
   webPushSample(sample);
   
-  Serial.println("==== Fin du cycle de lecture ====\n");
+  Serial.println("==== Fin du cycle de lecture ====");
+  Serial.println("[ACQUISITION] Donnees sauvegardees - Retour en mode attente\n");
   
   // Boucle rapide pendant la fenêtre active pour éventuelles mises à jour
   delay(5000);
