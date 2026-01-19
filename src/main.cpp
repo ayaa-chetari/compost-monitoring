@@ -13,9 +13,82 @@ const int DE_RE = 4;             // RS485 direction
 const int CAPTEUR_COUNT = 3;
 const uint8_t addresses[CAPTEUR_COUNT] = {1, 2, 3};
 
+// ==== Module GERUI MOSFET PWM ====
+const int MOSFET_RS485_PIN = 25;   // PWM pour 3 capteurs RS485 (temp/humidité)
+const int MOSFET_O2_PIN = 26;      // PWM pour capteur O2 I2C
+const int PWM_FREQUENCY = 5000;    // 5 kHz
+const int PWM_RESOLUTION = 8;      // 8-bit (0-255)
+const int PWM_CHANNEL_RS485 = 0;   // Canal PWM 0
+const int PWM_CHANNEL_O2 = 1;      // Canal PWM 1
+const int PWM_MAX = 255;           // Valeur max pour ON
+
+// ==== Timing gestion consommation ====
+const long READING_INTERVAL = 3600000;  // 1 heure en ms (3600000)
+const long ACTIVE_DURATION = 120000;    // 2 minutes en ms (120000)
+static unsigned long lastReadingTime = 0;
+static bool sensorsActive = false;
+static unsigned long activationStartTime = 0;
+
 // ==== Capteur O2 I2C ====
 const uint8_t OXYGEN_I2C_ADDR = 0x73; // à ajuster selon ton capteur
 float readOxygen();
+
+// ==== Déclarations forward des fonctions MOSFET ====
+void activateSensors();
+void deactivateSensors();
+void updateSensorPowerState();
+
+// ==== Contrôle PWM des modules MOSFET ====
+void initMOSFET() {
+  ledcSetup(PWM_CHANNEL_RS485, PWM_FREQUENCY, PWM_RESOLUTION);
+  ledcSetup(PWM_CHANNEL_O2, PWM_FREQUENCY, PWM_RESOLUTION);
+  
+  ledcAttachPin(MOSFET_RS485_PIN, PWM_CHANNEL_RS485);
+  ledcAttachPin(MOSFET_O2_PIN, PWM_CHANNEL_O2);
+  
+  // Démarrer en OFF
+  deactivateSensors();
+  
+  Serial.println("[MOSFET] Modules MOSFET initialisés");
+}
+
+void activateSensors() {
+  // Allumer tous les capteurs via PWM
+  ledcWrite(PWM_CHANNEL_RS485, PWM_MAX);  // ON (255)
+  ledcWrite(PWM_CHANNEL_O2, PWM_MAX);     // ON (255)
+  
+  sensorsActive = true;
+  activationStartTime = millis();
+  
+  Serial.println("[MOSFET] Capteurs ACTIVÉS");
+  delay(500);  // Attendre stabilisation
+}
+
+void deactivateSensors() {
+  // Éteindre tous les capteurs
+  ledcWrite(PWM_CHANNEL_RS485, 0);  // OFF
+  ledcWrite(PWM_CHANNEL_O2, 0);     // OFF
+  
+  sensorsActive = false;
+  
+  Serial.println("[MOSFET] Capteurs DÉSACTIVÉS");
+}
+
+// Vérifier si les capteurs doivent rester actifs
+void updateSensorPowerState() {
+  unsigned long currentTime = millis();
+  
+  // Vérifier si c'est le moment de réactiver
+  if (!sensorsActive && (currentTime - lastReadingTime >= READING_INTERVAL)) {
+    activateSensors();
+    lastReadingTime = currentTime;
+  }
+  
+  // Vérifier si les capteurs ont été actifs assez longtemps
+  if (sensorsActive && (currentTime - activationStartTime >= ACTIVE_DURATION)) {
+    deactivateSensors();
+  }
+}
 
 // ==== Variables globales pour les données ====
 struct SensorData {
@@ -201,6 +274,9 @@ void setup() {
   Wire.begin(21, 22);
   Wire.setClock(100000);  // 100 kHz
   
+  // Initialiser MOSFET PWM
+  initMOSFET();
+  
   // Initialiser SPIFFS
   initSPIFFS();
   
@@ -216,14 +292,32 @@ void setup() {
   // Initialiser le serveur web
   webInit();
   
+  // Première activation immédiate pour la première lecture
+  lastReadingTime = millis();
+  
   Serial.println("RS485 initialisé à 9600 baud");
   Serial.println("I2C initialisé à 100 kHz");
-  Serial.println("Lecture toutes les 10 secondes...\n");
+  Serial.println("MOSFET PWM configuré (2 min active / 1H d'intervalle)");
+  Serial.println("Attente de l'activation des capteurs...\n");
 }
 
 // ------------------ LOOP ------------------
 void loop() {
+  // Mettre à jour l'état d'alimentation des capteurs
+  updateSensorPowerState();
+  
+  // Si les capteurs ne sont pas actifs, attendre
+  if (!sensorsActive) {
+    unsigned long timeUntilNextReading = READING_INTERVAL - (millis() - lastReadingTime);
+    Serial.print("[SLEEP MODE] Prochaine lecture dans : ");
+    Serial.print(timeUntilNextReading / 1000);
+    Serial.println(" secondes");
+    delay(10000);  // Vérifier l'état tous les 10 secondes
+    return;
+  }
+
   // ===== LECTURE RS485 CAPTEURS SHT20 =====
+  Serial.println("\n[ACQUISITION] Lecture des capteurs RS485...");
   for (int i = 0; i < CAPTEUR_COUNT; i++) {
     uint8_t addr = addresses[i];
 
@@ -260,6 +354,7 @@ void loop() {
   }
 
   // ===== LECTURE I2C CAPTEUR O2 =====
+  Serial.println("[ACQUISITION] Lecture du capteur O2 I2C...");
   int bytesReceived = Wire.requestFrom((uint8_t)0x73, (size_t)2, (bool)true);
   
   if (bytesReceived >= 2) {
@@ -294,8 +389,10 @@ void loop() {
   
   webPushSample(sample);
   
-  Serial.println("==== Fin du cycle ====\n");
-  delay(10000);  // Une lecture toutes les 10 secondes
+  Serial.println("==== Fin du cycle de lecture ====\n");
+  
+  // Boucle rapide pendant la fenêtre active pour éventuelles mises à jour
+  delay(5000);
 }
 
 // ------------------ Lecture du capteur d'oxygène I2C ------------------
