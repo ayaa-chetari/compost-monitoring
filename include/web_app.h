@@ -13,6 +13,7 @@ struct Sample3 {
 
 // ===== API Web =====
 void webInit();           // Initialiser WiFi AP + serveur web
+void webStop();           // Arrêter WiFi AP + serveur web
 void webPushSample(const Sample3 &s);  // Ajouter données + CSV + SSE
 void webSetAccess(bool ok);  // Définir accès (pour NFC)
 void webLoop();           // Boucle web (optionnel)

@@ -138,7 +138,7 @@ static const char INDEX_HTML[] = R"HTML(
   <header>
     <div>
       <h1>IHM Station de compostage — 3 bacs</h1>
-      <div class="sub">ESP32 en point d’accès • Page embarquée • Live via SSE</div>
+      <div class="sub">ESP32 en point d’accès • Page embarquée</div>
     </div>
     <div class="pills">
       <div class="pill"><span class="dot" id="dotConn"></span><span id="connTxt">Connexion : —</span></div>

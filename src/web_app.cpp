@@ -169,6 +169,13 @@ void webInit() {
   Serial.println("Web server started !");
 }
 
+void webStop() {
+  server.end();
+  WiFi.softAPdisconnect(true);  // Arrêter le WiFi AP
+  WiFi.mode(WIFI_OFF);
+  Serial.println("\n===== WiFi AP Stopped =====\n");
+}
+
 void webPushSample(const Sample3 &s) {
   // Stocker en RAM + écrire CSV + SSE
   pushHistory(s);
