@@ -1,574 +1,316 @@
 #include <Arduino.h>
-#include <stdint.h>
 #include <HardwareSerial.h>
-#include <Wire.h>  // Pour I2C
-#include <SPIFFS.h>  // Système de fichiers
-#include <time.h>  // Pour l'horodatage
-#include <WiFi.h>  // Pour NTP
+#include <Wire.h>
+#include <SPIFFS.h>
+#include "esp_sleep.h"
 #include "web_app.h"
+#include <time.h>
 
-HardwareSerial RS485Serial(2);   // UART2 de l'ESP32
+// ================= RS485 =================
+HardwareSerial RS485Serial(2);
+const int DE_RE = 4;
+const int RS485_RX = 16;
+const int RS485_TX = 17;
+const int MOSFET_SHT20 = 32;  // MOSFET pour SHT20
 
-const int DE_RE = 4;             // RS485 direction
+// ================= BOUTON =================
+const int BUTTON_PIN = 27;
+volatile bool buttonPressed = false;
+volatile unsigned long buttonPressTime = 0;
+
+// ================= CAPTEURS =================
 const int CAPTEUR_COUNT = 3;
 const uint8_t addresses[CAPTEUR_COUNT] = {1, 2, 3};
+const uint8_t OXYGEN_I2C_ADDR = 0x73;
 
-// ==== Module GERUI MOSFET PWM ====
-const int MOSFET_RS485_PIN = 25;   // PWM pour 3 capteurs RS485 (temp/humidité)
-const int MOSFET_O2_PIN = 26;      // PWM pour capteur O2 I2C
-const int PWM_FREQUENCY = 5000;    // 5 kHz
-const int PWM_RESOLUTION = 8;      // 8-bit (0-255)
-const int PWM_CHANNEL_RS485 = 0;   // Canal PWM 0
-const int PWM_CHANNEL_O2 = 1;      // Canal PWM 1
-const int PWM_MAX = 255;           // Valeur max pour ON
+// ================= TIMING =================
+const unsigned long SLEEP_TIME_US = 5 * 60 * 1000000;  // 5 minutes en µs
+const unsigned long WIFI_TIMEOUT_MS = 5 * 60 * 1000;   // 5 min avant extinction WiFi (auto)
+const char *CSV_FILE = "/data.csv";
 
-// ==== Timing gestion consommation ====
-const long READING_INTERVAL = 3600000;  // 1 heure en ms (3600000)
-const long ACTIVE_DURATION = 120000;    // 2 minutes en ms (120000)
-static unsigned long lastReadingTime = 0;
-static bool sensorsActive = false;
-static unsigned long activationStartTime = 0;
+// ================= FLAGS =================
+bool wifiActive = false;
+unsigned long wifiStartTime = 0;
 
-// ==== Deep Sleep Configuration ====
-const int PUSHBUTTON_PIN = 13;          // Pin GPIO13 pour le bouton poussoir
-const int DEEP_SLEEP_TIMEOUT_US = 3600000000;  // 1 heure en microsecondes
-static bool wakeupByButton = false;     // Flag pour réveil par bouton
-static bool inAccessPointMode = false;  // Mode point d'accès activé
+// ================= UTILS MOSFET =================
+inline void sht20On()  { digitalWrite(MOSFET_SHT20, LOW); }
+inline void sht20Off() { digitalWrite(MOSFET_SHT20, HIGH); }
 
-// ==== Capteur O2 I2C ====
-const uint8_t OXYGEN_I2C_ADDR = 0x73; // à ajuster selon ton capteur
-float readOxygen();
-
-// ==== Déclarations forward des fonctions MOSFET ====
-void activateSensors();
-void deactivateSensors();
-void updateSensorPowerState();
-
-// ==== Déclarations forward pour Deep Sleep ====
-void enterDeepSleep();
-void handleButtonWakeup();
-void setupDeepSleepMode();
-
-// ==== Contrôle PWM des modules MOSFET ====
-void initMOSFET() {
-  ledcSetup(PWM_CHANNEL_RS485, PWM_FREQUENCY, PWM_RESOLUTION);
-  ledcSetup(PWM_CHANNEL_O2, PWM_FREQUENCY, PWM_RESOLUTION);
-  
-  ledcAttachPin(MOSFET_RS485_PIN, PWM_CHANNEL_RS485);
-  ledcAttachPin(MOSFET_O2_PIN, PWM_CHANNEL_O2);
-  
-  // Démarrer en OFF
-  deactivateSensors();
-  
-  Serial.println("[MOSFET] Modules MOSFET initialisés");
+// ================= INTERRUPT BOUTON =================
+void IRAM_ATTR handleButtonPress() {
+  buttonPressed = true;
+  buttonPressTime = millis();
+  Serial.println("\n!!! BOUTON APPUYE !!!"); // Debug direct
 }
 
-void activateSensors() {
-  // Allumer tous les capteurs via PWM
-  ledcWrite(PWM_CHANNEL_RS485, PWM_MAX);  // ON (255)
-  ledcWrite(PWM_CHANNEL_O2, PWM_MAX);     // ON (255)
+// ================= SPIFFS CSV =================
+void writeCSV(float t1, float h1, float o2_val, float t2, float h2, float t3, float h3) {
+  // Créer structure Sample3 pour web_app
+  Sample3 sample;
+  sample.t = time(nullptr);  // Heure système (synchronisée via NTP quand WiFi actif)
+  sample.b1Temp = t1;
+  sample.b1Hum = h1;
+  sample.b1O2 = o2_val;
+  sample.b2Temp = t2;
+  sample.b2Hum = h2;
+  sample.b3Temp = t3;
+  sample.b3Hum = h3;
   
-  sensorsActive = true;
-  activationStartTime = millis();
-  
-  Serial.println("[MOSFET] Capteurs ACTIVÉS");
-  delay(500);  // Attendre stabilisation
-}
+  // Si WiFi actif, utiliser web_app, sinon écrire directement
+  if (wifiActive) {
+    webPushSample(sample);
+  } else {
+    // Écrire CSV directement
+    File file = SPIFFS.open(CSV_FILE, FILE_APPEND);
+    if (!file) {
+      Serial.println("[CSV] Erreur ouverture");
+      return;
+    }
 
-void deactivateSensors() {
-  // Éteindre tous les capteurs
-  ledcWrite(PWM_CHANNEL_RS485, 0);  // OFF
-  ledcWrite(PWM_CHANNEL_O2, 0);     // OFF
-  
-  sensorsActive = false;
-  
-  Serial.println("[MOSFET] Capteurs DÉSACTIVÉS");
-}
+    file.print(sample.t);
+    file.print(",");
+    file.print(isnan(sample.b1Temp) ? "NAN" : String(sample.b1Temp, 2).c_str());
+    file.print(",");
+    file.print(isnan(sample.b1Hum) ? "NAN" : String(sample.b1Hum, 2).c_str());
+    file.print(",");
+    file.print(isnan(sample.b1O2) ? "NAN" : String(sample.b1O2, 2).c_str());
+    file.print(",");
+    file.print(isnan(sample.b2Temp) ? "NAN" : String(sample.b2Temp, 2).c_str());
+    file.print(",");
+    file.print(isnan(sample.b2Hum) ? "NAN" : String(sample.b2Hum, 2).c_str());
+    file.print(",");
+    file.print(isnan(sample.b3Temp) ? "NAN" : String(sample.b3Temp, 2).c_str());
+    file.print(",");
+    file.println(isnan(sample.b3Hum) ? "NAN" : String(sample.b3Hum, 2).c_str());
 
-// Vérifier si les capteurs doivent rester actifs
-void updateSensorPowerState() {
-  unsigned long currentTime = millis();
-  
-  // Vérifier si c'est le moment de réactiver
-  if (!sensorsActive && (currentTime - lastReadingTime >= READING_INTERVAL)) {
-    activateSensors();
-    lastReadingTime = currentTime;
-  }
-  
-  // Vérifier si les capteurs ont été actifs assez longtemps
-  if (sensorsActive && (currentTime - activationStartTime >= ACTIVE_DURATION)) {
-    deactivateSensors();
+    file.close();
+    Serial.println("[CSV] Donnees ecrites");
   }
 }
-
-// ================== DEEP SLEEP MODE ==================
-
-// Fonction appelée lors du réveil par bouton (ISR)
-void IRAM_ATTR handleButtonInterrupt() {
-  wakeupByButton = true;
-}
-
-// Configuration du deep sleep avec timer et bouton
-void setupDeepSleepMode() {
-  // Configurer le timer de deep sleep (1 heure)
-  esp_sleep_enable_timer_wakeup(DEEP_SLEEP_TIMEOUT_US);
-  
-  // Configurer le réveil par bouton (GPIO13, front descendant)
-  esp_sleep_enable_ext0_wakeup((gpio_num_t)PUSHBUTTON_PIN, 0);
-  
-  Serial.println("[DEEP SLEEP] Configuration: Timer 1H + Bouton GPIO13");
-}
-
-// Entrer en mode deep sleep
-void enterDeepSleep() {
-  Serial.println("\n[DEEP SLEEP] Extinction des capteurs et entrée en Deep Sleep...");
-  Serial.println("[DEEP SLEEP] Réveil dans 1 heure OU appui bouton");
-  
-  // Éteindre tous les capteurs
-  deactivateSensors();
-  
-  // Désactiver WiFi pour économiser la batterie
-  if (inAccessPointMode) {
-    webStop();
-    inAccessPointMode = false;
+uint16_t crc16(byte *data, int len) {
+  uint16_t crc = 0xFFFF;
+  for (int i = 0; i < len; i++) {
+    crc ^= data[i];
+    for (int b = 0; b < 8; b++)
+      crc = (crc >> 1) ^ ((crc & 1) ? 0xA001 : 0);
   }
-  
-  // Petite pause avant de dormir
-  delay(100);
-  Serial.println("[DEEP SLEEP] Zzzzzzz...");
-  
-  // Entrer en deep sleep
-  esp_deep_sleep_start();
+  return crc;
 }
 
-// Gérer le réveil et déterminer la source
-void handleWakeup() {
-  esp_sleep_wakeup_cause_t wakeup_reason = esp_sleep_get_wakeup_cause();
-  
-  switch (wakeup_reason) {
-    case ESP_SLEEP_WAKEUP_TIMER:
-      Serial.println("\n[WAKEUP] Réveil par TIMER - Collecte de données");
-      wakeupByButton = false;
-      sensorsActive = false;  // Réinitialiser pour la collecte
-      break;
-      
-    case ESP_SLEEP_WAKEUP_EXT0:
-      Serial.println("\n[WAKEUP] Réveil par BOUTON - Mode Point d'accès");
-      wakeupByButton = true;
-      inAccessPointMode = true;
-      // Redémarrer le serveur web pour l'accès à l'IHM
-      webInit();
-      break;
-      
-    default:
-      Serial.println("\n[WAKEUP] Premier démarrage ou réveil inconnu");
-      sensorsActive = false;
-  }
-}
-
-// ==== Variables globales pour les données ====
-struct SensorData {
-  float temp_bac1, hum_bac1;
-  float temp_bac2, hum_bac2;
-  float temp_bac3, hum_bac3;
-  float oxygen;
-} currentData;
-
-const char* CSV_FILE = "/data/sensors.csv";
-const char* NTP_SERVER = "pool.ntp.org";
-const long GMT_OFFSET_SEC = 3600;  // UTC+1 (France hiver) = 3600 sec
-const int DAYLIGHT_OFFSET_SEC = 3600;  // UTC+2 (France été) = 3600 sec additionnel
-// ------------------ Envoi d'une trame RS485 ------------------
-void sendFrame(uint8_t address, byte *frame, int length) {
+// ================= RS485 =================
+void sendFrame(byte *frame, int len) {
   digitalWrite(DE_RE, HIGH);
-  RS485Serial.write(frame, length);
+  RS485Serial.write(frame, len);
   RS485Serial.flush();
   digitalWrite(DE_RE, LOW);
 }
 
-// ------------------ Lecture registre RS485 ------------------
-float readRegister(uint8_t address, uint16_t reg) {
+float readRegister(uint8_t addr, uint16_t reg) {
   byte frame[8];
-  frame[0] = address;
+  frame[0] = addr;
   frame[1] = 0x04;
   frame[2] = reg >> 8;
   frame[3] = reg & 0xFF;
   frame[4] = 0x00;
   frame[5] = 0x01;
 
-  // CRC16
-  uint16_t crc = 0xFFFF;
-  for (int i = 0; i < 6; i++) {
-    crc ^= frame[i];
-    for (int b = 0; b < 8; b++) {
-      crc = (crc >> 1) ^ ((crc & 1) ? 0xA001 : 0);
-    }
-  }
+  uint16_t crc = crc16(frame, 6);
   frame[6] = crc & 0xFF;
   frame[7] = crc >> 8;
 
   while (RS485Serial.available()) RS485Serial.read();
-  sendFrame(address, frame, 8);
+  sendFrame(frame, 8);
+  delay(50);
 
-  unsigned long start = millis();
-  while (RS485Serial.available() < 7 && millis() - start < 200) {
-    delay(1);
-  }
+  unsigned long t0 = millis();
+  int available = 0;
+  while ((available = RS485Serial.available()) < 7 && millis() - t0 < 200) delay(1);
 
-  if (RS485Serial.available() >= 7) {
+  if (available >= 7) {
     byte resp[7];
     RS485Serial.readBytes(resp, 7);
-
-    if (resp[0] != address || resp[1] != 0x04) return NAN;
-
-    int16_t rawValue = (resp[3] << 8) | resp[4];
-    return rawValue / 10.0;
+    if (resp[0] == addr && resp[1] == 0x04) {
+      int16_t raw = (resp[3] << 8) | resp[4];
+      return raw / 10.0;
+    }
   }
-
   return NAN;
 }
 
-// -------- Initialiser SPIFFS --------
-bool initSPIFFS() {
-  if (!SPIFFS.begin(true)) {
-    Serial.println("Erreur initialisation SPIFFS");
-    return false;
-  }
+// ================= OXYGENE I2C =================
+float readOxygen() {
+  Wire.beginTransmission(OXYGEN_I2C_ADDR);
+  Wire.write(0x05);
+  int err = Wire.endTransmission(true);
   
-  // Créer le répertoire /data s'il n'existe pas
-  if (!SPIFFS.exists("/data")) {
-    File dir = SPIFFS.open("/data", FILE_WRITE);
-    dir.close();
-  }
+  if (err != 0) return NAN;
   
-  Serial.println("SPIFFS initialisé");
-  return true;
-}
-// -------- Synchroniser l'heure avec NTP --------
-void syncTimeWithNTP() {
-  Serial.println("Synchronisation avec NTP...");
-  configTime(GMT_OFFSET_SEC, DAYLIGHT_OFFSET_SEC, NTP_SERVER);
+  delay(100);
+  int bytes = Wire.requestFrom(OXYGEN_I2C_ADDR, (uint8_t)2);
   
-  time_t now = time(nullptr);
-  int attempts = 0;
-  while (now < 24 * 3600 && attempts < 20) {
-    delay(500);
-    Serial.print(".");
-    now = time(nullptr);
-    attempts++;
-  }
+  if (bytes < 2) return NAN;
+
+  uint8_t byte1 = Wire.read();
+  uint8_t byte2 = Wire.read();
+  uint16_t raw = (byte1 << 8) | byte2;
   
-  Serial.println();
-  Serial.print("Heure actuelle : ");
-  Serial.println(ctime(&now));
+  return raw / 100.0;
 }
 
-// -------- Écrire les données dans le CSV --------
-void writeDataToCSV(SensorData data) {
-  time_t now = time(nullptr);
-  struct tm* timeinfo = localtime(&now);
-  char timestamp[25];
-  strftime(timestamp, sizeof(timestamp), "%Y-%m-%d %H:%M:%S", timeinfo);
-  
-  // Vérifier si le fichier existe, sinon créer avec header
-  bool fileExists = SPIFFS.exists(CSV_FILE);
-  
-  File file = SPIFFS.open(CSV_FILE, FILE_APPEND);
-  if (!file) {
-    Serial.println("Erreur ouverture fichier CSV");
-    return;
-  }
-  
-  // Écrire le header si c'est la première fois
-  if (!fileExists) {
-    file.println("timestamp,temperature_bac1,humidity_bac1,oxygen,temperature_bac2,humidity_bac2,temperature_bac3,humidity_bac3");
-  }
-  
-  // Écrire une ligne de données
-  file.print(timestamp);
-  file.print(",");
-  file.print(data.temp_bac1, 2);
-  file.print(",");
-  file.print(data.hum_bac1, 2);
-  file.print(",");
-  file.print(data.oxygen, 2);
-  file.print(",");
-  file.print(data.temp_bac2, 2);
-  file.print(",");
-  file.print(data.hum_bac2, 2);
-  file.print(",");
-  file.print(data.temp_bac3, 2);
-  file.print(",");
-  file.println(data.hum_bac3, 2);
-  
-  file.close();
-  
-  Serial.print("[CSV] Données écrites : ");
-  Serial.println(timestamp);
-}
-
-// -------- Réinitialiser le bus I2C quand il est bloqué --------
-void resetI2CBus() {
-  Wire.end();
-  delay(50);
-  Wire.begin(21, 22);
-  Wire.setClock(25000);  // Très basse fréquence : 25 kHz
-  Serial.println("[I2C RESET]");
-}
-
-// ------------------ Scan I2C pour diagnostic ------------------
-void scanI2C() {
-  Serial.println("\n[I2C SCAN] Recherche des capteurs I2C...");
-  int count = 0;
-  for (byte i = 8; i < 120; i++) {
-    Wire.beginTransmission(i);
-    if (Wire.endTransmission() == 0) {
-      Serial.print("Capteur trouvé à l'adresse 0x");
-      Serial.println(i, HEX);
-      count++;
-    }
-  }
-  if (count == 0) {
-    Serial.println("⚠️ AUCUN capteur I2C détecté ! Vérifiez les connexions SDA/SCL");
-  }
-  Serial.println();
-}
-
-// ------------------ SETUP ------------------
+// ================= SETUP =================
 void setup() {
   Serial.begin(115200);
-  delay(2000);
-  
-  Serial.println("\n=== SYSTÈME DÉMARRAGE ===\n");
-  
-  // Vérifier la cause du réveil
-  handleWakeup();
-  
-  // Initialiser RS485
+  delay(1000);
+
   pinMode(DE_RE, OUTPUT);
   digitalWrite(DE_RE, LOW);
-  RS485Serial.begin(9600, SERIAL_8N1, 16, 17);
   
-  // Initialiser I2C
-  Wire.begin(21, 22);
-  Wire.setClock(100000);  // 100 kHz
+  pinMode(MOSFET_SHT20, OUTPUT);
+  sht20Off();
   
-  // Initialiser le bouton poussoir
-  pinMode(PUSHBUTTON_PIN, INPUT_PULLUP);
-  attachInterrupt(digitalPinToInterrupt(PUSHBUTTON_PIN), handleButtonInterrupt, FALLING);
+  // Init bouton avec interrupt
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(BUTTON_PIN), handleButtonPress, FALLING);
   
-  // Initialiser MOSFET PWM
-  initMOSFET();
-  
+  // Configurer GPIO27 comme source de wakeup (sortir du deep sleep)
+  esp_sleep_enable_ext0_wakeup(GPIO_NUM_27, 0);  // 0 = LOW (bouton appuyé)
+
+  RS485Serial.begin(9600, SERIAL_8N1, RS485_RX, RS485_TX);
+  Wire.begin();
+  Wire.setClock(100000);
+
   // Initialiser SPIFFS
-  initSPIFFS();
-  
-  // Synchroniser l'heure (nécessite WiFi)
-  // Pour tester sans WiFi : définir l'heure manuellement avec setTime()
-  // syncTimeWithNTP();  // À décommenter si WiFi disponible
-  
-  // Définir l'heure manuellement pour test (lundi 15 janvier 2024, 12:00:00)
-  time_t test_time = 1705317600;  // À adapter selon votre heure réelle
-  struct timeval tv = {.tv_sec = test_time};
-  settimeofday(&tv, NULL);
-  
-  // Configurer le deep sleep
-  setupDeepSleepMode();
-  
-  // Initialiser le serveur web (sera arrêté après collecte si en mode automatique)
-  if (!inAccessPointMode) {
-    webStop();
+  if (!SPIFFS.begin(true)) {
+    Serial.println("[SPIFFS] Erreur init");
   } else {
-    webInit();
-  }
-  
-  // Première activation immédiate pour la première lecture
-  lastReadingTime = millis();
-  
-  Serial.println("RS485 initialisé à 9600 baud");
-  Serial.println("I2C initialisé à 100 kHz");
-  Serial.println("Bouton configuré sur GPIO13");
-  Serial.println("MOSFET PWM configuré (2 min active / 1H d'intervalle)");
-  Serial.println("Deep Sleep configuré (réveil timer 1H + bouton)\n");
-}
-
-// ------------------ LOOP ------------------
-void loop() {
-  // Mettre à jour l'état d'alimentation des capteurs
-  updateSensorPowerState();
-  
-  // ===== MODE POINT D'ACCÈS (réveil par bouton) =====
-  if (inAccessPointMode) {
-    Serial.println("\n[MODE AP] Point d'accès actif - Interface web disponible");
-    Serial.println("[MODE AP] Appuyez sur le bouton pour revenir au mode collection automatique");
+    Serial.println("[SPIFFS] OK");
     
-    // Boucle infinie pour maintenir le point d'accès
-    while (inAccessPointMode) {
-      webLoop();  // Gérer les connexions web
-      
-      // Vérifier si le bouton a été appuyé pour quitter le mode AP
-      if (wakeupByButton) {
-        wakeupByButton = false;
-        inAccessPointMode = false;
-        Serial.println("[MODE AP] Fermeture du point d'accès - Entrée en Deep Sleep");
-        break;
+    // Créer header CSV s'il n'existe pas
+    if (!SPIFFS.exists(CSV_FILE)) {
+      File f = SPIFFS.open(CSV_FILE, FILE_WRITE);
+      if (f) {
+        f.println("timestamp,temperature_bac1,humidity_bac1,oxygen_bac1,temperature_bac2,humidity_bac2,temperature_bac3,humidity_bac3");
+        f.close();
+        Serial.println("[CSV] Header cree");
       }
-      
-      delay(100);
     }
-    
-    // Quitter le mode AP et entrer en deep sleep
-    enterDeepSleep();
-  }
-  
-  // ===== MODE COLLECTE AUTOMATIQUE =====
-  
-  // Si les capteurs ne sont pas actifs, attendre ou entrer en deep sleep
-  if (!sensorsActive) {
-    unsigned long timeUntilNextReading = READING_INTERVAL - (millis() - lastReadingTime);
-    Serial.print("[SLEEP MODE] Prochaine lecture dans : ");
-    Serial.print(timeUntilNextReading / 1000);
-    Serial.println(" secondes");
-    
-    // Attendre 5 secondes avant de revérifier
-    delay(5000);
-    
-    // Si le bouton a été appuyé, passer en mode point d'accès
-    if (wakeupByButton) {
-      wakeupByButton = false;
-      inAccessPointMode = true;
-      webInit();
-      return;  // Retour à la boucle pour gérer le mode AP
-    }
-    
-    // Vérifier s'il est temps d'entrer en deep sleep (après 5 secondes d'inactivité)
-    if (!sensorsActive && (millis() - lastReadingTime > 5000)) {
-      enterDeepSleep();
-    }
-    
-    return;
   }
 
-  // ===== LECTURE RS485 CAPTEURS SHT20 =====
-  Serial.println("\n[ACQUISITION] Lecture des capteurs RS485...");
-  for (int i = 0; i < CAPTEUR_COUNT; i++) {
-    uint8_t addr = addresses[i];
-
-    Serial.print("📟 SHT20 adresse ");
-    Serial.println(addr);
-
-    float temperature = readRegister(addr, 0x0001);
-    delay(100);
-    float humidity = readRegister(addr, 0x0002);
-
-    Serial.print("Température : ");
-    Serial.print(temperature);
-    Serial.println(" °C");
-
-    Serial.print("Humidité : ");
-    Serial.print(humidity);
-    Serial.println(" %RH");
-
-    Serial.println("---------------------------");
-    
-    // Stocker les données dans la structure
-    if (i == 0) {
-      currentData.temp_bac1 = temperature;
-      currentData.hum_bac1 = humidity;
-    } else if (i == 1) {
-      currentData.temp_bac2 = temperature;
-      currentData.hum_bac2 = humidity;
-    } else if (i == 2) {
-      currentData.temp_bac3 = temperature;
-      currentData.hum_bac3 = humidity;
-    }
-    
-    delay(500);
-  }
-
-  // ===== LECTURE I2C CAPTEUR O2 =====
-  Serial.println("[ACQUISITION] Lecture du capteur O2 I2C...");
-  int bytesReceived = Wire.requestFrom((uint8_t)0x73, (size_t)2, (bool)true);
-  
-  if (bytesReceived >= 2) {
-    uint8_t byte1 = Wire.read();
-    uint8_t byte2 = Wire.read();
-    uint16_t raw = (byte2 << 8) | byte1;
-    
-    float oxygen = raw / 100.0;
-    currentData.oxygen = oxygen;
-    
-    Serial.print("Oxygène : ");
-    Serial.print(oxygen);
-    Serial.println(" %Vol");
+  // Vérifier si bouton appuyé au démarrage
+  if (buttonPressed || (esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_EXT0)) {
+    Serial.println("[BOUTON] Détecté au wakeup - WiFi ON");
+    buttonPressed = true;  // Sera traité dans loop()
   } else {
-    Serial.println("Oxygène : Erreur lecture");
-    currentData.oxygen = NAN;
+    Serial.println("\n=== DEMARRAGE - COLLECTE ===");
+    Serial.println("Appuyer sur le BOUTON (GPIO27) pour activer le WiFi");
+    Serial.println("SSID: PolyGreen | Pass: compost123");
+    Serial.println("IP: 192.168.10.1");
   }
-  
-  // ===== ÉCRIRE DANS LE CSV =====
-  writeDataToCSV(currentData);
-  
-  // ===== ENVOYER VER LE WEB =====
-  Sample3 sample;
-  sample.t = time(nullptr);
-  sample.b1Temp = currentData.temp_bac1;
-  sample.b1Hum = currentData.hum_bac1;
-  sample.b1O2 = currentData.oxygen;
-  sample.b2Temp = currentData.temp_bac2;
-  sample.b2Hum = currentData.hum_bac2;
-  sample.b3Temp = currentData.temp_bac3;
-  sample.b3Hum = currentData.hum_bac3;
-  
-  webPushSample(sample);
-  
-  Serial.println("==== Fin du cycle de lecture ====");
-  Serial.println("[ACQUISITION] Donnees sauvegardees - Retour en mode attente\n");
-  
-  // Boucle rapide pendant la fenêtre active pour éventuelles mises à jour
-  delay(5000);
 }
 
-// ------------------ Lecture du capteur d'oxygène I2C ------------------
-float readOxygen() {
-  static unsigned long lastReadTime = 0;
-  unsigned long now = millis();
-  
-  // Lire seulement tous les 30 secondes
-  if (now - lastReadTime < 30000) {
-    return NAN;
+// ================= LOOP =================
+void loop() {
+  // Vérifier si bouton appuyé
+  if (buttonPressed) {
+    if (wifiActive) {
+      // WiFi actif: 2e appui = arrêter WiFi
+      Serial.println("[BOUTON] 2e appui - WiFi OFF");
+      webStop();
+      wifiActive = false;
+      buttonPressed = false;
+      delay(500);  // Debounce
+      // Relancer deep sleep normal
+      esp_sleep_enable_timer_wakeup(SLEEP_TIME_US);
+      esp_sleep_enable_ext0_wakeup(GPIO_NUM_27, 0);
+      esp_deep_sleep_start();
+    } else {
+      // WiFi inactif: 1er appui = démarrer WiFi
+      Serial.println("[BOUTON] 1er appui - WiFi ON");
+      wifiActive = true;
+      wifiStartTime = millis();
+      buttonPressed = false;
+      delay(200);  // Debounce
+      webInit();
+      return;  // Rester en WiFi
+    }
   }
-  
-  lastReadTime = now;
-  Serial.println("[O2] Tentative de lecture...");
-  
-  // Attendre un peu avant de lire
+
+  // Si WiFi actif
+  if (wifiActive) {
+    // Vérifier timeout WiFi (5 minutes)
+    if (millis() - wifiStartTime > WIFI_TIMEOUT_MS) {
+      Serial.println("[WiFi] Timeout (5min) - Arrêt AUTO");
+      webStop();
+      wifiActive = false;
+      buttonPressed = false;
+      delay(500);
+      // Relancer deep sleep normal
+      esp_sleep_enable_timer_wakeup(SLEEP_TIME_US);
+      esp_sleep_enable_ext0_wakeup(GPIO_NUM_27, 0);
+      esp_deep_sleep_start();
+    }
+    
+    // Boucle WiFi légère
+    delay(100);
+    return;  // Ne pas faire de collecte pendant WiFi
+  }
+
+  // Mode collecte (sans WiFi)
+  Serial.println("=== COLLECTE DE DONNEES ===");
+
+  // -------- ACTIVATION SHT20 --------
+  sht20On();
+  delay(500);
+
+  // -------- LECTURE RS485 SHT20 --------
+  float t1 = readRegister(addresses[0], 0x0001);
+  delay(100);
+  float h1 = readRegister(addresses[0], 0x0002);
   delay(100);
   
-  // SIMPLE : lire 2 octets sans rien écrire
-  int bytesReceived = Wire.requestFrom((uint8_t)0x73, (size_t)2, (bool)true);
+  float t2 = readRegister(addresses[1], 0x0001);
+  delay(100);
+  float h2 = readRegister(addresses[1], 0x0002);
+  delay(100);
   
-  Serial.print("[O2] Bytes reçus: ");
-  Serial.println(bytesReceived);
+  float t3 = readRegister(addresses[2], 0x0001);
+  delay(100);
+  float h3 = readRegister(addresses[2], 0x0002);
+
+  // -------- DESACTIVATION SHT20 --------
+  sht20Off();
+
+  // -------- LECTURE OXYGENE I2C --------
+  float o2 = readOxygen();
+
+  // -------- AFFICHER RESULTATS --------
+  Serial.print("SHT20-1: T=");
+  Serial.print(t1, 1);
+  Serial.print(" H=");
+  Serial.println(h1, 1);
   
-  if (bytesReceived >= 2) {
-    uint8_t byte1 = Wire.read();
-    uint8_t byte2 = Wire.read();
-    uint16_t raw = (byte2 << 8) | byte1;
-    
-    Serial.print("[O2] Raw: ");
-    Serial.println(raw);
-    
-    // Valider (0-21000 = 0-210%)
-    if (raw > 0 && raw <= 21000) {
-      float oxygen = raw / 100.0;
-      Serial.print("[O2 SUCCESS] ");
-      Serial.print(oxygen);
-      Serial.println(" %Vol");
-      return oxygen;
-    }
-  }
+  Serial.print("SHT20-2: T=");
+  Serial.print(t2, 1);
+  Serial.print(" H=");
+  Serial.println(h2, 1);
   
-  Serial.println("[O2] Pas de réponse");
-  return NAN;
+  Serial.print("SHT20-3: T=");
+  Serial.print(t3, 1);
+  Serial.print(" H=");
+  Serial.println(h3, 1);
+  
+  Serial.print("O2: ");
+  Serial.println(o2, 1);
+
+  // -------- ENREGISTRER CSV --------
+  writeCSV(t1, h1, o2, t2, h2, t3, h3);
+
+  // -------- SLEEP 5 MIN --------
+  Serial.println("[SLEEP] Deep sleep 5 min...");
+  Serial.println("Appuyer BOUTON pour activer WiFi");
+  delay(500);  // Temps pour que les prints passent
+  
+  esp_sleep_enable_timer_wakeup(SLEEP_TIME_US);
+  esp_sleep_enable_ext0_wakeup(GPIO_NUM_27, 0);  // Réactiver bouton wakeup
+  esp_deep_sleep_start();
 }

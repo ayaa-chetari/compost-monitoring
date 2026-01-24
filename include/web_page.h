@@ -372,6 +372,16 @@ static const char INDEX_HTML[] = R"HTML(
   let hoverIdxCmp = null;
 
   function nowLocal(){ return new Date().toLocaleTimeString(); }
+  function formatTimestamp(t){
+    if(!isFinite(t)) return '--';
+    const d = new Date(t * 1000);  // Convert seconds to ms
+    return d.toLocaleString();
+  }
+  function formatTimestampShort(t){
+    if(!isFinite(t)) return '--';
+    const d = new Date(t * 1000);
+    return d.toLocaleString('fr-FR', {year:'2-digit', month:'2-digit', day:'2-digit', hour:'2-digit', minute:'2-digit'});
+  }
   function setConn(state){
     dotConn.className = 'dot ' + state;
     connTxt.textContent = (state==='ok')?'Connexion : LIVE':(state==='warn')?'Connexion : instable':'Connexion : perdue';
@@ -394,7 +404,7 @@ static const char INDEX_HTML[] = R"HTML(
   }
 
   function updateCards(d){
-    elTs.textContent = d.t ?? '--';
+    elTs.textContent = formatTimestamp(d.t);
 
     const b1 = d.b1 || {};
     const b1t = Number(b1.tempC), b1h = Number(b1.humPct), b1o = Number(b1.o2Pct);
@@ -403,13 +413,13 @@ static const char INDEX_HTML[] = R"HTML(
     b1O2.textContent   = isFinite(b1o)? b1o.toFixed(2) : '--';
     stateBadge(b1Badge, b1State, worstOf([evalTemp(b1t).lvl, evalHum(b1h).lvl, evalO2(b1o).lvl]));
 
-    const b2 = d.b2 || {};
+    const b2 = d.b3 || {};
     const b2t = Number(b2.tempC), b2h = Number(b2.humPct);
     b2Temp.textContent = isFinite(b2t)? b2t.toFixed(2) : '--';
     b2Hum.textContent  = isFinite(b2h)? b2h.toFixed(2) : '--';
     stateBadge(b2Badge, b2State, worstOf([evalTemp(b2t).lvl, evalHum(b2h).lvl]));
 
-    const b3 = d.b3 || {};
+    const b3 = d.b2 || {};
     const b3t = Number(b3.tempC), b3h = Number(b3.humPct);
     b3Temp.textContent = isFinite(b3t)? b3t.toFixed(2) : '--';
     b3Hum.textContent  = isFinite(b3h)? b3h.toFixed(2) : '--';
@@ -670,8 +680,8 @@ static const char INDEX_HTML[] = R"HTML(
       const tt = S.t[i];
       const vT = S.temp[i], vH = S.hum[i], vO = S.o2[i];
       const lines = (selected===1)
-        ? [`t: ${tt} s`, `Temp: ${Number.isFinite(vT)?vT.toFixed(2):'--'} °C`, `Hum: ${Number.isFinite(vH)?vH.toFixed(2):'--'} %`, `O₂: ${Number.isFinite(vO)?vO.toFixed(2):'--'} %`]
-        : [`t: ${tt} s`, `Temp: ${Number.isFinite(vT)?vT.toFixed(2):'--'} °C`, `Hum: ${Number.isFinite(vH)?vH.toFixed(2):'--'} %`];
+        ? [`${formatTimestampShort(tt)}`, `Temp: ${Number.isFinite(vT)?vT.toFixed(2):'--'} °C`, `Hum: ${Number.isFinite(vH)?vH.toFixed(2):'--'} %`, `O₂: ${Number.isFinite(vO)?vO.toFixed(2):'--'} %`]
+        : [`${formatTimestampShort(tt)}`, `Temp: ${Number.isFinite(vT)?vT.toFixed(2):'--'} °C`, `Hum: ${Number.isFinite(vH)?vH.toFixed(2):'--'} %`];
 
       drawTooltip(ctxBac, dpr, L, T, PW, PH, x, T+Math.floor(12*dpr), lines);
     }
@@ -750,7 +760,7 @@ static const char INDEX_HTML[] = R"HTML(
       const v1 = b1[i], v2 = b2[i], v3 = b3[i];
       const suffix = (field==='tempC') ? '°C' : '%';
       const lines = [
-        `t: ${tt} s`,
+        `${formatTimestampShort(tt)}`,
         `Bac 1: ${Number.isFinite(v1)?v1.toFixed(2):'--'} ${suffix}`,
         `Bac 2: ${Number.isFinite(v2)?v2.toFixed(2):'--'} ${suffix}`,
         `Bac 3: ${Number.isFinite(v3)?v3.toFixed(2):'--'} ${suffix}`,
@@ -815,7 +825,7 @@ static const char INDEX_HTML[] = R"HTML(
     const last = history.slice(-10).reverse();
     tbody.innerHTML = last.map(p => {
       const b = p['b'+selected] || {};
-      const t = p.t ?? '';
+      const t = formatTimestamp(p.t);
       const temp = Number(b.tempC);
       const hum  = Number(b.humPct);
       const o2   = Number(b.o2Pct);
@@ -838,6 +848,7 @@ static const char INDEX_HTML[] = R"HTML(
       history = await r.json();
       refreshTable();
       redrawAll();
+      if (history.length) updateCards(history[history.length - 1]);
       hintEl.textContent = `Historique RAM chargé : ${history.length} points`;
     }catch(e){
       errEl.textContent = 'Échec /api/history';
@@ -935,8 +946,30 @@ static const char INDEX_HTML[] = R"HTML(
   function init(){
     setSelected(1);
     setViewMode('bac');
-    loadHistory();
     startSSE();
+    
+    // Synchro d'heure client FIRST
+    console.log('[INIT] Synchro heure du client...');
+    const now = Math.floor(Date.now() / 1000);
+    const url = `/api/settime?time=${now}`;
+    
+    fetch(url, {method:'POST'})
+      .then(r => {
+        console.log('[SETTIME] Response status:', r.status);
+        return r.json();
+      })
+      .then((d) => {
+        console.log('[TIME] Synchro OK:', d);
+        // Charger l'historique APRÈS la synchro
+        console.log('[INIT] Chargement historique après synchro...');
+        setTimeout(loadHistory, 300);
+      })
+      .catch(e => {
+        console.log('[TIME] Synchro échouée:', e);
+        // Charger quand même si la synchro échoue
+        loadHistory();
+      });
+    
     window.addEventListener('resize', ()=>redrawAll());
   }
   init();
