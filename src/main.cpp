@@ -24,7 +24,9 @@ const uint8_t addresses[CAPTEUR_COUNT] = {1, 2, 3};
 const uint8_t OXYGEN_I2C_ADDR = 0x73;
 
 // ================= TIMING =================
-const unsigned long SLEEP_TIME_US = 5 * 60 * 1000000;  // 5 minutes en µs
+//const unsigned long SLEEP_TIME_US = 5 * 60 * 1000000;  // 5 minutes en µs
+
+const unsigned long SLEEP_TIME_US = 60 * 60 * 1000000;  // 1 heure en µs
 const unsigned long WIFI_TIMEOUT_MS = 5 * 60 * 1000;   // 5 min avant extinction WiFi (auto)
 const char *CSV_FILE = "/data.csv";
 
